@@ -1,61 +1,99 @@
 package org.geektimes.cache.redis;
 
 import org.geektimes.cache.AbstractCache;
+import org.geektimes.cache.ExpirableEntry;
+import org.geektimes.commons.io.Deserializer;
+import org.geektimes.commons.io.Deserializers;
+import org.geektimes.commons.io.Serializer;
+import org.geektimes.commons.io.Serializers;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.params.SetParams;
 
 import javax.cache.CacheException;
-import javax.cache.CacheManager;
 import javax.cache.configuration.Configuration;
-import java.io.*;
-import java.util.Iterator;
+import java.io.IOException;
+import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.Set;
+
+import static redis.clients.jedis.params.SetParams.setParams;
 
 public class JedisCache<K extends Serializable, V extends Serializable> extends AbstractCache<K, V> {
 
     private final Jedis jedis;
 
-    public JedisCache(CacheManager cacheManager, String cacheName,
+    private final Serializers serializers;
+
+    private final Deserializers deserializers;
+
+    private final byte[] keyPrefixBytes;
+
+    private final int keyPrefixBytesLength;
+
+    public JedisCache(JedisCacheManager jedisCacheManager, String cacheName,
                       Configuration<K, V> configuration, Jedis jedis) {
-        super(cacheManager, cacheName, configuration);
+        super(jedisCacheManager, cacheName, configuration);
         this.jedis = jedis;
+        this.serializers = jedisCacheManager.getSerializers();
+        this.deserializers = jedisCacheManager.getDeserializers();
+        this.keyPrefixBytes = buildKeyPrefixBytes(cacheName);
+        this.keyPrefixBytesLength = keyPrefixBytes.length;
     }
 
     @Override
-    protected V doGet(K key) throws CacheException, ClassCastException {
-        byte[] keyBytes = serialize(key);
-        return doGet(keyBytes);
+    protected boolean containsEntry(K key) throws CacheException, ClassCastException {
+        byte[] keyBytes = getKeyBytes(key);
+        return jedis.exists(keyBytes);
     }
 
-    protected V doGet(byte[] keyBytes) {
+    @Override
+    protected ExpirableEntry<K, V> getEntry(K key) throws CacheException, ClassCastException {
+        byte[] keyBytes = getKeyBytes(key);
+        return getEntry(keyBytes);
+    }
+
+    protected ExpirableEntry<K, V> getEntry(byte[] keyBytes) throws CacheException, ClassCastException {
         byte[] valueBytes = jedis.get(keyBytes);
-        V value = deserialize(valueBytes);
-        return value;
+        return deserialize(valueBytes, ExpirableEntry.class);
     }
 
     @Override
-    protected V doPut(K key, V value) throws CacheException, ClassCastException {
-        byte[] keyBytes = serialize(key);
-        byte[] valueBytes = serialize(value);
-        V oldValue = doGet(keyBytes);
-        jedis.set(keyBytes, valueBytes);
-        return oldValue;
+    protected void putEntry(ExpirableEntry<K, V> entry) throws CacheException, ClassCastException {
+        byte[] keyBytes = getKeyBytes(entry.getKey());
+        byte[] valueBytes = serialize(entry);
+        if (entry.isEternal()) {
+            jedis.set(keyBytes, valueBytes);
+        } else {
+            jedis.set(keyBytes, valueBytes, setParams().px(entry.getExpiredTime()));
+        }
     }
 
     @Override
-    protected V doRemove(K key) throws CacheException, ClassCastException {
-        byte[] keyBytes = serialize(key);
-        V oldValue = doGet(keyBytes);
+    protected ExpirableEntry<K, V> removeEntry(K key) throws CacheException, ClassCastException {
+        byte[] keyBytes = getKeyBytes(key);
+        ExpirableEntry<K, V> oldEntry = getEntry(keyBytes);
         jedis.del(keyBytes);
-        return oldValue;
+        return oldEntry;
     }
 
     @Override
-    protected void doClear() throws CacheException {
-
+    protected void clearEntries() throws CacheException {
+        Set<byte[]> keysBytes = jedis.keys(keyPrefixBytes);
+        for (byte[] keyBytes : keysBytes) {
+            jedis.del(keyBytes);
+        }
     }
 
     @Override
-    protected Iterator<Entry<K, V>> newIterator() {
-        return null;
+    protected Set<K> keySet() {
+        Set<byte[]> keysBytes = jedis.keys(keyPrefixBytes);
+        Set<K> keys = new LinkedHashSet<>(keysBytes.size());
+        for (byte[] keyBytes : keysBytes) {
+            keys.add(deserialize(keyBytes, getConfiguration().getKeyType()));
+        }
+        return Collections.unmodifiableSet(keys);
     }
 
     @Override
@@ -63,35 +101,39 @@ public class JedisCache<K extends Serializable, V extends Serializable> extends 
         this.jedis.close();
     }
 
-    // 是否可以抽象出一套序列化和反序列化的 API
-    private byte[] serialize(Object value) throws CacheException {
-        byte[] bytes = null;
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-             ObjectOutputStream objectOutputStream = new ObjectOutputStream(outputStream)
-        ) {
-            // Key -> byte[]
-            objectOutputStream.writeObject(value);
-            bytes = outputStream.toByteArray();
-        } catch (IOException e) {
-            throw new CacheException(e);
-        }
+
+    private byte[] buildKeyPrefixBytes(String cacheName) {
+        StringBuilder keyPrefixBuilder = new StringBuilder("JedisCache-")
+                .append(cacheName).append(":");
+        return keyPrefixBuilder.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] getKeyBytes(Object key) {
+        byte[] suffixBytes = serialize(key);
+        int suffixBytesLength = suffixBytes.length;
+        byte[] bytes = new byte[keyPrefixBytesLength + suffixBytesLength];
+        System.arraycopy(keyPrefixBytes, 0, bytes, 0, keyPrefixBytesLength);
+        System.arraycopy(suffixBytes, 0, bytes, keyPrefixBytesLength, suffixBytesLength);
         return bytes;
     }
 
-    private V deserialize(byte[] bytes) throws CacheException {
-        if (bytes == null) {
-            return null;
-        }
-        V value = null;
-        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(bytes);
-             ObjectInputStream objectInputStream = new ObjectInputStream(inputStream)
-        ) {
-            // byte[] -> Value
-            value = (V) objectInputStream.readObject();
-        } catch (Exception e) {
+    // 是否可以抽象出一套序列化和反序列化的 API
+    private byte[] serialize(Object value) throws CacheException {
+        Serializer serializer = serializers.getMostCompatible(value.getClass());
+        try {
+            return serializer.serialize(value);
+        } catch (IOException e) {
             throw new CacheException(e);
         }
-        return value;
+    }
+
+    private <T> T deserialize(byte[] bytes, Class<T> deserializedType) throws CacheException {
+        Deserializer deserializer = deserializers.getMostCompatible(deserializedType);
+        try {
+            return (T) deserializer.deserialize(bytes);
+        } catch (IOException e) {
+            throw new CacheException(e);
+        }
     }
 
 }
